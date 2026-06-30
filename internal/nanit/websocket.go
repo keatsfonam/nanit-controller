@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/gorilla/websocket"
+	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 	"google.golang.org/protobuf/proto"
 )
 

@@ -23,9 +23,9 @@ type pathsResponse struct {
 }
 
 type Path struct {
-	Name   string           `json:"name"`
-	Ready  bool             `json:"ready"`
-	Source *json.RawMessage `json:"source"`
+	Name   string          `json:"name"`
+	Ready  bool            `json:"ready"`
+	Source json.RawMessage `json:"source"`
 }
 
 func (c *Client) PathReady(ctx context.Context, name string) (bool, error) {
@@ -35,10 +35,15 @@ func (c *Client) PathReady(ctx context.Context, name string) (bool, error) {
 	}
 	for _, p := range paths {
 		if p.Name == name {
-			return p.Ready || p.Source != nil, nil
+			return p.Ready || hasSource(p.Source), nil
 		}
 	}
 	return false, nil
+}
+
+func hasSource(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s != "" && s != "null" && s != "{}"
 }
 
 func (c *Client) Paths(ctx context.Context) ([]Path, error) {

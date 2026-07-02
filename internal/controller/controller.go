@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -14,17 +15,50 @@ import (
 	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 )
 
+type nanitService interface {
+	EnsureAuthorized(ctx context.Context, bootstrapRefreshToken string, force bool) error
+	FetchBabies(ctx context.Context, bootstrapRefreshToken string) ([]session.Baby, error)
+}
+
+type mediaChecker interface {
+	PathReady(ctx context.Context, name string) (bool, error)
+}
+
+type streamConn interface {
+	SendStreaming(ctx context.Context, rtmpURL string, status indie.Streaming_Status, timeout time.Duration) error
+	Done() <-chan struct{}
+	Close() error
+}
+
+type dialWSFunc func(ctx context.Context, cameraUID, accessToken string, log *slog.Logger) (streamConn, error)
+
 type Controller struct {
 	cfg      config.Config
 	store    *session.Store
-	nanit    *nanit.Client
-	mediamtx *mediamtx.Client
+	nanit    nanitService
+	mediamtx mediaChecker
 	log      *slog.Logger
+	status   *StatusRegistry
+	dialWS   dialWSFunc
+	sleep    func(context.Context, time.Duration)
 }
 
 func New(cfg config.Config, store *session.Store, log *slog.Logger) *Controller {
-	return &Controller{cfg: cfg, store: store, nanit: nanit.NewClient(store, log.With("component", "nanit")), mediamtx: mediamtx.New(cfg.MediaMTXAPIURL), log: log}
+	return &Controller{
+		cfg:      cfg,
+		store:    store,
+		nanit:    nanit.NewClient(store, log.With("component", "nanit")),
+		mediamtx: mediamtx.New(cfg.MediaMTXAPIURL),
+		log:      log,
+		status:   NewStatusRegistry(),
+		dialWS: func(ctx context.Context, cameraUID, accessToken string, log *slog.Logger) (streamConn, error) {
+			return nanit.DialWS(ctx, cameraUID, accessToken, log)
+		},
+		sleep: sleep,
+	}
 }
+
+func (c *Controller) Status() *StatusRegistry { return c.status }
 
 func (c *Controller) Run(ctx context.Context) error {
 	babies, err := c.nanit.FetchBabies(ctx, c.cfg.BootstrapRefreshToken)
@@ -40,9 +74,11 @@ func (c *Controller) Run(ctx context.Context) error {
 	for _, uid := range c.cfg.BabyUIDs {
 		baby, ok := byUID[uid]
 		if !ok {
+			c.status.RegisterMissing(uid)
 			c.log.Warn("configured baby UID not found in Nanit account", "baby_uid", uid)
 			continue
 		}
+		c.status.RegisterBaby(baby, c.cfg.PathName(baby.UID), c.cfg.RTMPURL(baby.UID))
 		wg.Add(1)
 		go func(b session.Baby) {
 			defer wg.Done()
@@ -54,82 +90,233 @@ func (c *Controller) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
+type reconcileOutcome string
+
+const (
+	reconcileDisconnected    reconcileOutcome = "websocket_disconnected"
+	reconcileConnectionLimit reconcileOutcome = "connection_limit"
+)
+
 func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
 	log := c.log.With("baby_uid", baby.UID, "camera_uid", baby.CameraUID, "baby_name", baby.Name)
+	retry := newExponentialBackoff(c.cfg.RetryBackoffMax, 0.2, rand.New(rand.NewSource(time.Now().UnixNano())))
 	for ctx.Err() == nil {
 		if err := c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, false); err != nil {
 			log.Error("authorization failed", "error", err)
-			sleep(ctx, time.Minute)
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "authorization_failed"
+				st.LastError = err.Error()
+				st.WebsocketConnected = false
+			})
+			c.sleepWithStatus(ctx, baby.UID, retry.Next(c.cfg.RetryBackoffInitial))
 			continue
 		}
 		s := c.store.Snapshot()
-		ws, err := nanit.DialWS(ctx, baby.CameraUID, s.AuthToken, log)
+		ws, err := c.dialWS(ctx, baby.CameraUID, s.AuthToken, log)
 		if err != nil {
 			log.Error("websocket connection failed", "error", err)
 			_ = c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, true)
-			sleep(ctx, time.Minute)
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "websocket_dial_failed"
+				st.LastError = err.Error()
+				st.WebsocketConnected = false
+			})
+			c.sleepWithStatus(ctx, baby.UID, retry.Next(c.cfg.RetryBackoffInitial))
 			continue
 		}
-		c.reconcile(ctx, baby, ws, log)
+		c.status.Update(baby.UID, func(st *CameraStatus) {
+			st.State = "websocket_connected"
+			st.WebsocketConnected = true
+			st.LastError = ""
+		})
+		outcome := c.reconcile(ctx, baby, ws, log, retry)
+		// Always release the WebSocket before any retry/backoff sleep. This is especially
+		// important after Nanit reports mobile app connection-limit errors.
 		_ = ws.Close()
-		sleep(ctx, 15*time.Second)
+		c.status.Update(baby.UID, func(st *CameraStatus) {
+			st.WebsocketConnected = false
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		base := c.cfg.RetryBackoffInitial
+		if outcome == reconcileConnectionLimit {
+			base = c.cfg.ConnectionLimitBackoff
+		}
+		c.sleepWithStatus(ctx, baby.UID, retry.Next(base))
 	}
 }
 
-func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws *nanit.WS, log *slog.Logger) {
+func (c *Controller) sleepWithStatus(ctx context.Context, babyUID string, d time.Duration) {
+	until := time.Now().Add(d)
+	c.status.Update(babyUID, func(st *CameraStatus) {
+		st.State = "backing_off"
+		st.BackoffUntil = &until
+		st.NextRetryAt = &until
+	})
+	c.sleep(ctx, d)
+	c.status.Update(babyUID, func(st *CameraStatus) {
+		st.BackoffUntil = nil
+		st.NextRetryAt = nil
+	})
+}
+
+func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws streamConn, log *slog.Logger, retry *exponentialBackoff) reconcileOutcome {
 	rtmpURL := c.cfg.RTMPURL(baby.UID)
 	path := c.cfg.PathName(baby.UID)
 	lastRequest := time.Time{}
 	missingSince := time.Now()
+	missingRetryCount := 0
 
-	request := func(reason string) {
-		if time.Since(lastRequest) < c.cfg.ReRequestInterval {
-			return
-		}
-		lastRequest = time.Now()
-		log.Info("requesting local streaming", "target", rtmpURL, "path", path, "reason", reason)
-		err := ws.SendStreaming(ctx, rtmpURL, indie.Streaming_STARTED, c.cfg.RequestTimeout)
+	sendStreaming := func(status indie.Streaming_Status, reason string) reconcileOutcome {
+		now := time.Now()
+		statusName := streamingStatusName(status)
+		log.Info("requesting local streaming", "target", rtmpURL, "path", path, "reason", reason, "status", statusName)
+		c.status.Update(baby.UID, func(st *CameraStatus) {
+			st.State = "requesting_streaming"
+			st.LastRequestStatus = statusName
+			st.LastRequestReason = reason
+			st.LastRequestAt = &now
+		})
+		err := ws.SendStreaming(ctx, rtmpURL, status, c.cfg.RequestTimeout)
 		switch {
 		case err == nil:
-			log.Info("local streaming successfully requested", "path", path)
+			log.Info("local streaming request accepted", "path", path, "status", statusName)
+			successAt := time.Now()
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "streaming_requested"
+				st.LastSuccessAt = &successAt
+				st.LastError = ""
+				if status == indie.Streaming_STARTED {
+					st.ConsecutiveConnectionLimitFailures = 0
+				}
+			})
+			return ""
 		case errors.Is(err, nanit.ErrConnectionLimit):
-			log.Warn("too many Nanit mobile app connections", "error", err, "backoff", c.cfg.ConnectionLimitBackoff)
-			sleep(ctx, c.cfg.ConnectionLimitBackoff)
+			log.Warn("too many Nanit mobile app connections", "error", err)
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "connection_limited"
+				st.LastError = err.Error()
+				st.ConsecutiveConnectionLimitFailures++
+			})
+			return reconcileConnectionLimit
 		default:
-			log.Warn("local streaming request failed", "error", err)
+			log.Warn("local streaming request failed", "error", err, "status", statusName)
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "request_failed"
+				st.LastError = err.Error()
+			})
+			return ""
 		}
 	}
 
-	request("websocket_connected")
+	requestStarted := func(reason string) reconcileOutcome {
+		if !lastRequest.IsZero() && time.Since(lastRequest) < c.cfg.ReRequestInterval {
+			return ""
+		}
+		lastRequest = time.Now()
+		return sendStreaming(indie.Streaming_STARTED, reason)
+	}
+
+	if out := requestStarted("websocket_connected"); out != "" {
+		return out
+	}
 	ticker := time.NewTicker(c.cfg.CheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return reconcileDisconnected
 		case <-ws.Done():
 			log.Warn("websocket disconnected")
-			return
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "websocket_disconnected"
+				st.WebsocketConnected = false
+			})
+			return reconcileDisconnected
 		case <-ticker.C:
 			ready, err := c.mediamtx.PathReady(ctx, path)
 			if err != nil {
 				log.Warn("mediamtx path check failed", "path", path, "error", err)
+				c.status.Update(baby.UID, func(st *CameraStatus) {
+					st.State = "mediamtx_check_failed"
+					st.LastError = err.Error()
+				})
 				continue
 			}
 			if ready {
+				now := time.Now()
 				missingSince = time.Time{}
+				missingRetryCount = 0
+				retry.Reset()
 				log.Debug("mediamtx path is ready", "path", path)
+				c.status.Update(baby.UID, func(st *CameraStatus) {
+					st.State = "ready"
+					st.PublisherPresent = true
+					st.PublisherLastSeen = &now
+					st.MissingSince = nil
+					st.MissingRetryCount = 0
+					st.LastError = ""
+					st.ConsecutiveConnectionLimitFailures = 0
+				})
 				continue
 			}
+
+			now := time.Now()
+			c.status.Update(baby.UID, func(st *CameraStatus) {
+				st.State = "publisher_missing"
+				st.PublisherPresent = false
+				st.MissingRetryCount = missingRetryCount
+			})
 			if missingSince.IsZero() {
-				missingSince = time.Now()
+				missingSince = now
 				log.Info("mediamtx path missing", "path", path)
+				c.status.Update(baby.UID, func(st *CameraStatus) { st.MissingSince = &now })
 				continue
 			}
-			if time.Since(missingSince) >= c.cfg.MissingGrace {
-				request("mediamtx_path_missing")
+			c.status.Update(baby.UID, func(st *CameraStatus) { st.MissingSince = &missingSince })
+			if time.Since(missingSince) < c.cfg.MissingGrace {
+				continue
+			}
+			if !lastRequest.IsZero() && time.Since(lastRequest) < c.cfg.ReRequestInterval {
+				continue
+			}
+
+			missingRetryCount++
+			c.status.Update(baby.UID, func(st *CameraStatus) { st.MissingRetryCount = missingRetryCount })
+			if c.cfg.MissingPublisherRestartRetries > 0 && missingRetryCount >= c.cfg.MissingPublisherRestartRetries {
+				log.Warn("resetting local streaming after missing publisher retries", "path", path, "missing_retry_count", missingRetryCount)
+				if out := sendStreaming(indie.Streaming_STOPPED, "mediamtx_path_missing_reset"); out != "" {
+					return out
+				}
+				c.sleep(ctx, 2*time.Second)
+				if ctx.Err() != nil {
+					return reconcileDisconnected
+				}
+				lastRequest = time.Now()
+				missingRetryCount = 0
+				c.status.Update(baby.UID, func(st *CameraStatus) { st.MissingRetryCount = 0 })
+				if out := sendStreaming(indie.Streaming_STARTED, "mediamtx_path_missing_reset"); out != "" {
+					return out
+				}
+				continue
+			}
+
+			if out := requestStarted("mediamtx_path_missing"); out != "" {
+				return out
 			}
 		}
+	}
+}
+
+func streamingStatusName(status indie.Streaming_Status) string {
+	switch status {
+	case indie.Streaming_STARTED:
+		return "STARTED"
+	case indie.Streaming_STOPPED:
+		return "STOPPED"
+	default:
+		return status.String()
 	}
 }
 

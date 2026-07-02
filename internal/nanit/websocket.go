@@ -21,6 +21,7 @@ type WS struct {
 	conn      *websocket.Conn
 	log       *slog.Logger
 	nextID    int32
+	writeMu   sync.Mutex
 	pendingMu sync.Mutex
 	pending   map[int32]chan responseResult
 	closed    chan struct{}
@@ -179,6 +180,8 @@ func (w *WS) send(msg *indie.Message) error {
 	if err != nil {
 		return err
 	}
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
 	return w.conn.WriteMessage(websocket.BinaryMessage, b)
 }
 

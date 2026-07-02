@@ -24,6 +24,7 @@ type pathsResponse struct {
 
 type Path struct {
 	Name   string          `json:"name"`
+	Online *bool           `json:"online,omitempty"`
 	Ready  bool            `json:"ready"`
 	Source json.RawMessage `json:"source"`
 }
@@ -35,6 +36,9 @@ func (c *Client) PathReady(ctx context.Context, name string) (bool, error) {
 	}
 	for _, p := range paths {
 		if p.Name == name {
+			if p.Online != nil {
+				return *p.Online, nil
+			}
 			return p.Ready || hasSource(p.Source), nil
 		}
 	}

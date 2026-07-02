@@ -12,13 +12,17 @@ func TestPathReady(t *testing.T) {
 		if r.URL.Path != "/v3/paths/list" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"items":[{"name":"local/ef693503","ready":true},{"name":"local/source","ready":false,"source":{"type":"rtmpSession"}},{"name":"local/missing","ready":false,"source":null}]}`))
+		_, _ = w.Write([]byte(`{"items":[{"name":"local/ef693503","online":true,"ready":false},{"name":"local/offline","online":false,"ready":true,"source":{"type":"rtmpSession"}},{"name":"local/source","ready":false,"source":{"type":"rtmpSession"}},{"name":"local/missing","ready":false,"source":null}]}`))
 	}))
 	defer srv.Close()
 	c := New(srv.URL)
 	ready, err := c.PathReady(context.Background(), "local/ef693503")
 	if err != nil || !ready {
 		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	ready, err = c.PathReady(context.Background(), "local/offline")
+	if err != nil || ready {
+		t.Fatalf("offline ready=%v err=%v", ready, err)
 	}
 	ready, err = c.PathReady(context.Background(), "local/source")
 	if err != nil || !ready {

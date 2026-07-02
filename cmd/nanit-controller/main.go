@@ -32,9 +32,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go serveHealth(cfg.HealthAddr, logger)
-
 	ctrl := controller.New(cfg, store, logger)
+	go serveHealth(cfg.HealthAddr, ctrl.Status(), logger)
+
 	logger.Info("starting Nanit controller", "baby_uids", cfg.BabyUIDs, "rtmp_addr", cfg.RTMPPublicAddr, "mediamtx_api", cfg.MediaMTXAPIURL)
 	if err := ctrl.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("controller stopped", "error", err)
@@ -43,10 +43,10 @@ func main() {
 	logger.Info("controller stopped")
 }
 
-func serveHealth(addr string, logger *slog.Logger) {
+func serveHealth(addr string, status *controller.StatusRegistry, logger *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
+	mux.Handle("/readyz", status)
 	if err := http.ListenAndServe(addr, mux); err != nil && err != http.ErrServerClosed {
 		logger.Warn("health server failed", "error", err)
 	}

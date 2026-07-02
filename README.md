@@ -8,7 +8,8 @@ It does not serve RTMP, MQTT, Home Assistant entities, or sensor data. It only:
 2. discovers configured babies/cameras;
 3. opens Nanit WebSocket control connections;
 4. sends `PUT_STREAMING STARTED` with an explicit RTMP URL;
-5. monitors MediaMTX path readiness and re-requests streaming when the publisher disappears.
+5. monitors MediaMTX path readiness and re-requests streaming when the publisher disappears;
+6. backs off per camera, releases WebSockets on Nanit connection-limit errors, and can reset stale local-streaming state with `STOPPED`/`STARTED`.
 
 ## Configuration
 
@@ -25,14 +26,26 @@ Environment variables:
 | `NANIT_CHECK_INTERVAL` | `20s` | MediaMTX path check interval. |
 | `NANIT_MISSING_GRACE` | `30s` | Missing-path grace period before re-requesting. |
 | `NANIT_REREQUEST_INTERVAL` | `60s` | Minimum interval between PUT_STREAMING requests per camera. |
-| `NANIT_CONNECTION_LIMIT_BACKOFF` | `5m` | Backoff when Nanit reports mobile app connection limit. |
+| `NANIT_MISSING_PUBLISHER_RESTART_RETRIES` | `3` | Missing-publisher re-requests before sending `PUT_STREAMING STOPPED` then `STARTED`. Set `0` to disable reset. |
+| `NANIT_RETRY_BACKOFF_INITIAL` | `15s` | Initial per-camera reconnect backoff for ordinary failures. |
+| `NANIT_RETRY_BACKOFF_MAX` | `15m` | Maximum per-camera exponential backoff. |
+| `NANIT_CONNECTION_LIMIT_BACKOFF` | `5m` | Initial per-camera backoff when Nanit reports mobile app connection limit. |
 | `NANIT_REQUEST_TIMEOUT` | `30s` | WebSocket request timeout. |
 | `NANIT_HEALTH_ADDR` | `:8080` | Health endpoint address. |
 | `NANIT_LOG_LEVEL` | `info` | `debug` or `info`. |
+
+## Health and status
+
+`/healthz` is a lightweight liveness endpoint that returns `ok`.
+
+`/readyz` returns HTTP 200 with a JSON snapshot for each configured camera. Camera-level degraded states such as `connection_limited` or `publisher_missing` are intentionally reported in the JSON body without failing the HTTP probe, because Kubernetes restarts can worsen Nanit mobile connection-slot exhaustion.
+
+Example fields include `publisher_present`, `missing_since`, `missing_retry_count`, `last_request_status`, `last_success_at`, `last_error`, `consecutive_connection_limit_failures`, and `backoff_until`.
 
 ## Local test
 
 ```sh
 go test ./...
+go test -race ./...
 go run ./cmd/nanit-controller
 ```

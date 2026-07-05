@@ -3,3 +3,5 @@
 *.test
 .DS_Store
 coverage.out
+.claude/
+session.json

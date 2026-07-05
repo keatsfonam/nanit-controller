@@ -90,9 +90,9 @@ func (c *Controller) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// fetchBabiesWithFallback keeps startup alive when the Nanit API is briefly
-// unreachable: it prefers the baby list cached in the session file, and
-// otherwise retries discovery with backoff instead of crash-looping the pod.
+// fetchBabiesWithFallback falls back to the session-cached baby list when
+// discovery fails, and retries with backoff when there is no cache, so a
+// Nanit outage at startup doesn't crash-loop the pod.
 func (c *Controller) fetchBabiesWithFallback(ctx context.Context) ([]session.Baby, error) {
 	retry := newExponentialBackoff(c.cfg.RetryBackoffMax, 0.2, nil)
 	for {

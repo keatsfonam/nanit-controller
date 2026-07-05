@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"git.keatsfonam.com/lab/nanit-controller/internal/config"
 	"git.keatsfonam.com/lab/nanit-controller/internal/controller"
@@ -47,7 +48,8 @@ func serveHealth(addr string, status *controller.StatusRegistry, logger *slog.Lo
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.Handle("/readyz", status)
-	if err := http.ListenAndServe(addr, mux); err != nil && err != http.ErrServerClosed {
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Warn("health server failed", "error", err)
 	}
 }

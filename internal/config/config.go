@@ -30,6 +30,7 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	var errs []string
 	cfg := Config{
 		SessionFile:                    getEnv("NANIT_SESSION_FILE", "/data/session.json"),
 		BootstrapRefreshToken:          strings.TrimSpace(os.Getenv("NANIT_BOOTSTRAP_REFRESH_TOKEN")),
@@ -37,16 +38,19 @@ func Load() (Config, error) {
 		RTMPPublicAddr:                 strings.TrimSpace(os.Getenv("NANIT_RTMP_PUBLIC_ADDR")),
 		RTMPPathPrefix:                 cleanPrefix(getEnv("NANIT_RTMP_PATH_PREFIX", "/local")),
 		MediaMTXAPIURL:                 strings.TrimRight(getEnv("NANIT_MEDIAMTX_API_URL", "http://127.0.0.1:9997"), "/"),
-		CheckInterval:                  getDuration("NANIT_CHECK_INTERVAL", 20*time.Second),
-		MissingGrace:                   getDuration("NANIT_MISSING_GRACE", 30*time.Second),
-		ReRequestInterval:              getDuration("NANIT_REREQUEST_INTERVAL", 60*time.Second),
-		MissingPublisherRestartRetries: getInt("NANIT_MISSING_PUBLISHER_RESTART_RETRIES", 3),
-		RetryBackoffInitial:            getDuration("NANIT_RETRY_BACKOFF_INITIAL", 15*time.Second),
-		RetryBackoffMax:                getDuration("NANIT_RETRY_BACKOFF_MAX", 15*time.Minute),
-		ConnectionLimitBackoff:         getDuration("NANIT_CONNECTION_LIMIT_BACKOFF", 5*time.Minute),
-		RequestTimeout:                 getDuration("NANIT_REQUEST_TIMEOUT", 30*time.Second),
+		CheckInterval:                  getDuration("NANIT_CHECK_INTERVAL", 20*time.Second, &errs),
+		MissingGrace:                   getDuration("NANIT_MISSING_GRACE", 30*time.Second, &errs),
+		ReRequestInterval:              getDuration("NANIT_REREQUEST_INTERVAL", 60*time.Second, &errs),
+		MissingPublisherRestartRetries: getInt("NANIT_MISSING_PUBLISHER_RESTART_RETRIES", 3, &errs),
+		RetryBackoffInitial:            getDuration("NANIT_RETRY_BACKOFF_INITIAL", 15*time.Second, &errs),
+		RetryBackoffMax:                getDuration("NANIT_RETRY_BACKOFF_MAX", 15*time.Minute, &errs),
+		ConnectionLimitBackoff:         getDuration("NANIT_CONNECTION_LIMIT_BACKOFF", 5*time.Minute, &errs),
+		RequestTimeout:                 getDuration("NANIT_REQUEST_TIMEOUT", 30*time.Second, &errs),
 		HealthAddr:                     getEnv("NANIT_HEALTH_ADDR", ":8080"),
 		LogLevel:                       parseLevel(getEnv("NANIT_LOG_LEVEL", "info")),
+	}
+	if len(errs) > 0 {
+		return cfg, errors.New(strings.Join(errs, "; "))
 	}
 	return cfg, cfg.Validate()
 }
@@ -114,25 +118,27 @@ func cleanPrefix(v string) string {
 	return strings.TrimRight(v, "/")
 }
 
-func getDuration(key string, def time.Duration) time.Duration {
+func getDuration(key string, def time.Duration, errs *[]string) time.Duration {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return def
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: invalid duration %q", key, v))
 		return def
 	}
 	return d
 }
 
-func getInt(key string, def int) int {
+func getInt(key string, def int, errs *[]string) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return def
 	}
 	i, err := strconv.Atoi(v)
 	if err != nil {
+		*errs = append(*errs, fmt.Sprintf("%s: invalid integer %q", key, v))
 		return def
 	}
 	return i

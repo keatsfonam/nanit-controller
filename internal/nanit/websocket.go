@@ -15,7 +15,18 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var ErrConnectionLimit = errors.New("nanit mobile app connection limit")
+var (
+	ErrConnectionLimit = errors.New("nanit mobile app connection limit")
+	// ErrDialUnauthorized marks websocket handshakes rejected with 401/403,
+	// i.e. failures a token refresh could fix.
+	ErrDialUnauthorized = errors.New("nanit websocket dial unauthorized")
+)
+
+const (
+	wsReadLimit    = 1 << 20
+	wsReadTimeout  = 75 * time.Second
+	wsWriteTimeout = 10 * time.Second
+)
 
 type WS struct {
 	conn      *websocket.Conn
@@ -37,10 +48,22 @@ func DialWS(ctx context.Context, cameraUID, accessToken string, log *slog.Logger
 	url := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%s/user_connect", cameraUID)
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+accessToken)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, header)
+	conn, res, err := websocket.DefaultDialer.DialContext(ctx, url, header)
 	if err != nil {
+		if res != nil && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
+			return nil, fmt.Errorf("%w: status=%d: %v", ErrDialUnauthorized, res.StatusCode, err)
+		}
 		return nil, err
 	}
+	conn.SetReadLimit(wsReadLimit)
+	_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	})
+	conn.SetPingHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(wsWriteTimeout))
+	})
 	w := &WS{conn: conn, log: log.With("camera_uid", cameraUID), pending: map[int32]chan responseResult{}, closed: make(chan struct{})}
 	go w.readLoop()
 	go w.keepAliveLoop()
@@ -69,6 +92,13 @@ func (w *WS) keepAliveLoop() {
 				_ = w.Close()
 				return
 			}
+			// The websocket-level ping solicits a pong that extends the read
+			// deadline; app-level KEEPALIVE messages get no response.
+			if err := w.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
+				w.log.Warn("ping failed", "error", err)
+				_ = w.Close()
+				return
+			}
 		}
 	}
 }
@@ -82,6 +112,7 @@ func (w *WS) readLoop() {
 			w.failAll(err)
 			return
 		}
+		_ = w.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		var msg indie.Message
 		if err := proto.Unmarshal(data, &msg); err != nil {
 			w.log.Warn("malformed websocket protobuf", "error", err)
@@ -162,6 +193,9 @@ func (w *WS) SendStreaming(ctx context.Context, rtmpURL string, status indie.Str
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		w.pendingMu.Lock()
+		delete(w.pending, id)
+		w.pendingMu.Unlock()
 		return ctx.Err()
 	case <-w.closed:
 		return errors.New("websocket closed")
@@ -182,6 +216,7 @@ func (w *WS) send(msg *indie.Message) error {
 	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
+	_ = w.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	return w.conn.WriteMessage(websocket.BinaryMessage, b)
 }
 

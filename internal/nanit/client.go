@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"git.keatsfonam.com/lab/nanit-controller/internal/session"
@@ -18,9 +19,13 @@ import (
 var ErrExpiredRefreshToken = errors.New("refresh token expired")
 
 type Client struct {
-	http  *http.Client
-	store *session.Store
-	log   *slog.Logger
+	http    *http.Client
+	store   *session.Store
+	log     *slog.Logger
+	baseURL string
+	// refreshMu serializes token refreshes: Nanit rotates refresh tokens, so
+	// concurrent refreshes with the same token can invalidate the session.
+	refreshMu sync.Mutex
 }
 
 type authResponse struct {
@@ -33,13 +38,25 @@ type babiesResponse struct {
 }
 
 func NewClient(store *session.Store, log *slog.Logger) *Client {
-	return &Client{http: &http.Client{Timeout: 15 * time.Second}, store: store, log: log}
+	return &Client{http: &http.Client{Timeout: 15 * time.Second}, store: store, log: log, baseURL: "https://api.nanit.com"}
 }
 
 func (c *Client) EnsureAuthorized(ctx context.Context, bootstrapRefreshToken string, force bool) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	// Re-check under the lock: a goroutine that waited here behind a
+	// successful refresh must not consume the freshly rotated token again.
 	s := c.store.Snapshot()
-	if !force && s.AuthToken != "" && time.Since(s.AuthTime) < 45*time.Minute {
-		return nil
+	if s.AuthToken != "" {
+		age := time.Since(s.AuthTime)
+		if !force && age < 45*time.Minute {
+			return nil
+		}
+		// A token refreshed moments ago satisfies force: another goroutine
+		// already re-authorized after the failure the caller observed.
+		if force && age < 30*time.Second {
+			return nil
+		}
 	}
 	refresh := strings.TrimSpace(s.RefreshToken)
 	if refresh == "" {
@@ -56,7 +73,7 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.nanit.com/tokens/refresh", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/tokens/refresh", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -97,7 +114,7 @@ func (c *Client) FetchBabies(ctx context.Context, bootstrapRefreshToken string) 
 			return nil, err
 		}
 		s := c.store.Snapshot()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.nanit.com/babies", nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/babies", nil)
 		if err != nil {
 			return nil, err
 		}

@@ -61,7 +61,7 @@ func New(cfg config.Config, store *session.Store, log *slog.Logger) *Controller 
 func (c *Controller) Status() *StatusRegistry { return c.status }
 
 func (c *Controller) Run(ctx context.Context) error {
-	babies, err := c.nanit.FetchBabies(ctx, c.cfg.BootstrapRefreshToken)
+	babies, err := c.fetchBabiesWithFallback(ctx)
 	if err != nil {
 		return err
 	}
@@ -90,12 +90,40 @@ func (c *Controller) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// fetchBabiesWithFallback keeps startup alive when the Nanit API is briefly
+// unreachable: it prefers the baby list cached in the session file, and
+// otherwise retries discovery with backoff instead of crash-looping the pod.
+func (c *Controller) fetchBabiesWithFallback(ctx context.Context) ([]session.Baby, error) {
+	retry := newExponentialBackoff(c.cfg.RetryBackoffMax, 0.2, nil)
+	for {
+		babies, err := c.nanit.FetchBabies(ctx, c.cfg.BootstrapRefreshToken)
+		if err == nil {
+			return babies, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if cached := c.store.Snapshot().Babies; len(cached) > 0 {
+			c.log.Warn("fetch babies failed, using cached baby list from session", "error", err)
+			return cached, nil
+		}
+		d := retry.Next(c.cfg.RetryBackoffInitial)
+		c.log.Warn("fetch babies failed, retrying", "error", err, "retry_in", d)
+		c.sleep(ctx, d)
+	}
+}
+
 type reconcileOutcome string
 
 const (
 	reconcileDisconnected    reconcileOutcome = "websocket_disconnected"
 	reconcileConnectionLimit reconcileOutcome = "connection_limit"
+	reconcileRequestsFailing reconcileOutcome = "requests_failing"
 )
+
+// maxConsecutiveSendFailures bounds streaming requests on a connection that
+// accepts writes but never succeeds; past it the socket is torn down and redialed.
+const maxConsecutiveSendFailures = 3
 
 func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
 	log := c.log.With("baby_uid", baby.UID, "camera_uid", baby.CameraUID, "baby_name", baby.Name)
@@ -115,7 +143,11 @@ func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
 		ws, err := c.dialWS(ctx, baby.CameraUID, s.AuthToken, log)
 		if err != nil {
 			log.Error("websocket connection failed", "error", err)
-			_ = c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, true)
+			// Only burn a refresh-token rotation when the handshake was
+			// rejected for auth reasons; network blips don't need it.
+			if errors.Is(err, nanit.ErrDialUnauthorized) {
+				_ = c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, true)
+			}
 			c.status.Update(baby.UID, func(st *CameraStatus) {
 				st.State = "websocket_dial_failed"
 				st.LastError = err.Error()
@@ -167,6 +199,7 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 	lastRequest := time.Time{}
 	missingSince := time.Now()
 	missingRetryCount := 0
+	consecutiveSendFailures := 0
 
 	sendStreaming := func(status indie.Streaming_Status, reason string) reconcileOutcome {
 		now := time.Now()
@@ -181,6 +214,7 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 		err := ws.SendStreaming(ctx, rtmpURL, status, c.cfg.RequestTimeout)
 		switch {
 		case err == nil:
+			consecutiveSendFailures = 0
 			log.Info("local streaming request accepted", "path", path, "status", statusName)
 			successAt := time.Now()
 			c.status.Update(baby.UID, func(st *CameraStatus) {
@@ -201,11 +235,16 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 			})
 			return reconcileConnectionLimit
 		default:
-			log.Warn("local streaming request failed", "error", err, "status", statusName)
+			consecutiveSendFailures++
+			log.Warn("local streaming request failed", "error", err, "status", statusName, "consecutive_failures", consecutiveSendFailures)
 			c.status.Update(baby.UID, func(st *CameraStatus) {
 				st.State = "request_failed"
 				st.LastError = err.Error()
 			})
+			if consecutiveSendFailures >= maxConsecutiveSendFailures {
+				log.Warn("streaming requests keep failing, reconnecting websocket", "consecutive_failures", consecutiveSendFailures)
+				return reconcileRequestsFailing
+			}
 			return ""
 		}
 	}

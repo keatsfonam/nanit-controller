@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nanit-relay
+  labels:
+    app.kubernetes.io/name: nanit-relay
+spec:
+  # One replica, Recreate: the session PVC is RWO and each controller
+  # instance consumes a Nanit "mobile app" connection slot.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nanit-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nanit-relay
+    spec:
+      securityContext:
+        # The controller image runs as nonroot (uid 65532); this lets it
+        # write the session file on the PVC.
+        fsGroup: 65532
+      containers:
+        - name: mediamtx
+          image: bluenviron/mediamtx:1
+          args:
+            - /mediamtx.yml
+          ports:
+            - name: rtmp
+              containerPort: 1935
+              protocol: TCP
+            - name: rtsp
+              containerPort: 8554
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /mediamtx.yml
+              subPath: mediamtx.yml
+              readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: rtsp
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            tcpSocket:
+              port: rtsp
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: rtsp
+            initialDelaySeconds: 30
+            periodSeconds: 30
+        - name: controller
+          image: ghcr.io/keatsfonam/nanit-controller:0.1
+          env:
+            - name: NANIT_BOOTSTRAP_REFRESH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nanit-secret
+                  key: refresh-token
+            - name: NANIT_BABY_UIDS
+              value: 0a1b2c3d,4e5f6a7b
+            # Must match the service's external IP; cameras connect to it.
+            - name: NANIT_RTMP_PUBLIC_ADDR
+              value: 192.168.1.10:1935
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: nanit-relay-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: nanit-data

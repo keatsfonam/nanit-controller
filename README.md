@@ -37,7 +37,7 @@ docker run -d --name nanit-controller \
   ghcr.io/keatsfonam/nanit-controller:latest
 ```
 
-On Kubernetes: single-replica Deployment, `/data` on a PersistentVolume, bootstrap token in a Secret. Don't run more than one replica; each instance takes up a Nanit "mobile app" connection slot.
+For Kubernetes, [examples/kubernetes](examples/kubernetes) has a full setup running the controller as a MediaMTX sidecar. Don't run more than one replica; each instance takes up a Nanit "mobile app" connection slot.
 
 ## Configuration
 

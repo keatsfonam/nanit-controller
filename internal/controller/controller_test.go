@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
@@ -15,11 +17,37 @@ import (
 	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 )
 
-type fakeNanitService struct{}
+type fakeNanitService struct {
+	mu          sync.Mutex
+	forceCalls  int
+	fetchCalls  int
+	failFetches int
+	babies      []session.Baby
+}
 
-func (fakeNanitService) EnsureAuthorized(context.Context, string, bool) error { return nil }
-func (fakeNanitService) FetchBabies(context.Context, string) ([]session.Baby, error) {
-	return nil, nil
+func (f *fakeNanitService) EnsureAuthorized(_ context.Context, _ string, force bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if force {
+		f.forceCalls++
+	}
+	return nil
+}
+
+func (f *fakeNanitService) FetchBabies(context.Context, string) ([]session.Baby, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchCalls++
+	if f.fetchCalls <= f.failFetches {
+		return nil, errors.New("nanit api unavailable")
+	}
+	return f.babies, nil
+}
+
+func (f *fakeNanitService) counts() (fetch, force int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fetchCalls, f.forceCalls
 }
 
 type fakeMediaChecker struct {
@@ -83,7 +111,7 @@ func testController(t *testing.T, cfg config.Config) *Controller {
 	return &Controller{
 		cfg:      cfg,
 		store:    store,
-		nanit:    fakeNanitService{},
+		nanit:    &fakeNanitService{},
 		mediamtx: fakeMediaChecker{},
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		status:   NewStatusRegistry(),
@@ -161,6 +189,97 @@ func TestReconcileSendsStoppedThenStartedAfterMissingPublisherRetries(t *testing
 	want := []indie.Streaming_Status{indie.Streaming_STARTED, indie.Streaming_STARTED, indie.Streaming_STOPPED, indie.Streaming_STARTED}
 	if got := ws.Calls(); !reflect.DeepEqual(got[:len(want)], want) {
 		t.Fatalf("unexpected streaming requests: got %v want prefix %v", got, want)
+	}
+}
+
+func TestReconcileReconnectsAfterConsecutiveSendFailures(t *testing.T) {
+	cfg := testConfig()
+	cfg.MissingPublisherRestartRetries = 0
+	ctrl := testController(t, cfg)
+	ctrl.mediamtx = fakeMediaChecker{ready: false}
+	baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
+	ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+	ws := newFakeStreamConn()
+	ws.errFor[indie.Streaming_STARTED] = errors.New("stream request rejected")
+
+	out := ctrl.reconcile(context.Background(), baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
+	if out != reconcileRequestsFailing {
+		t.Fatalf("outcome=%s, want %s", out, reconcileRequestsFailing)
+	}
+	if got := len(ws.Calls()); got != maxConsecutiveSendFailures {
+		t.Fatalf("streaming requests=%d, want %d", got, maxConsecutiveSendFailures)
+	}
+}
+
+func TestFetchBabiesFallsBackToCachedSession(t *testing.T) {
+	ctrl := testController(t, testConfig())
+	cached := []session.Baby{{UID: "baby", CameraUID: "camera", Name: "Baby"}}
+	if err := ctrl.store.Update(func(s *session.Session) { s.Babies = cached }); err != nil {
+		t.Fatal(err)
+	}
+	svc := &fakeNanitService{failFetches: 100}
+	ctrl.nanit = svc
+
+	babies, err := ctrl.fetchBabiesWithFallback(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(babies, cached) {
+		t.Fatalf("babies=%#v, want cached %#v", babies, cached)
+	}
+	if fetch, _ := svc.counts(); fetch != 1 {
+		t.Fatalf("fetch calls=%d, want 1", fetch)
+	}
+}
+
+func TestFetchBabiesRetriesWithoutCache(t *testing.T) {
+	ctrl := testController(t, testConfig())
+	want := []session.Baby{{UID: "baby", CameraUID: "camera", Name: "Baby"}}
+	svc := &fakeNanitService{failFetches: 2, babies: want}
+	ctrl.nanit = svc
+
+	babies, err := ctrl.fetchBabiesWithFallback(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(babies, want) {
+		t.Fatalf("babies=%#v, want %#v", babies, want)
+	}
+	if fetch, _ := svc.counts(); fetch != 3 {
+		t.Fatalf("fetch calls=%d, want 3", fetch)
+	}
+}
+
+func TestRunBabyForcesRefreshOnlyOnAuthDialFailure(t *testing.T) {
+	cases := []struct {
+		name       string
+		dialErr    error
+		wantForced int
+	}{
+		{name: "network error", dialErr: errors.New("connection refused"), wantForced: 0},
+		{name: "auth error", dialErr: fmt.Errorf("%w: status=401", nanit.ErrDialUnauthorized), wantForced: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			ctrl := testController(t, cfg)
+			svc := &fakeNanitService{}
+			ctrl.nanit = svc
+			baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
+			ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctrl.dialWS = func(context.Context, string, string, *slog.Logger) (streamConn, error) {
+				return nil, tc.dialErr
+			}
+			ctrl.sleep = func(context.Context, time.Duration) { cancel() }
+
+			ctrl.runBaby(ctx, baby)
+			if _, forced := svc.counts(); forced != tc.wantForced {
+				t.Fatalf("force refresh calls=%d, want %d", forced, tc.wantForced)
+			}
+		})
 	}
 }
 

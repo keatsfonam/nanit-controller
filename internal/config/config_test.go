@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,6 +39,22 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if c.RetryBackoffInitial != 10*time.Second || c.RetryBackoffMax != 2*time.Minute {
 		t.Fatalf("unexpected backoff config: initial=%s max=%s", c.RetryBackoffInitial, c.RetryBackoffMax)
+	}
+}
+
+func TestLoadRejectsMalformedValues(t *testing.T) {
+	t.Setenv("NANIT_BABY_UIDS", "ef693503")
+	t.Setenv("NANIT_RTMP_PUBLIC_ADDR", "192.168.130.129:1935")
+	t.Setenv("NANIT_CHECK_INTERVAL", "20 s")
+	t.Setenv("NANIT_MISSING_PUBLISHER_RESTART_RETRIES", "three")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for malformed env values")
+	}
+	for _, key := range []string{"NANIT_CHECK_INTERVAL", "NANIT_MISSING_PUBLISHER_RESTART_RETRIES"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("error %q does not mention %s", err, key)
+		}
 	}
 }
 

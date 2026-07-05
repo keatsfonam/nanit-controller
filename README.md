@@ -9,11 +9,14 @@ It does not serve RTMP, MQTT, Home Assistant entities, or sensor data. It only:
 3. opens Nanit WebSocket control connections;
 4. sends `PUT_STREAMING STARTED` with an explicit RTMP URL;
 5. monitors MediaMTX path readiness and re-requests streaming when the publisher disappears;
-6. backs off per camera, releases WebSockets on Nanit connection-limit errors, and can reset stale local-streaming state with `STOPPED`/`STARTED`.
+6. backs off per camera, releases WebSockets on Nanit connection-limit errors, and can reset stale local-streaming state with `STOPPED`/`STARTED`;
+7. enforces WebSocket read/write deadlines with ping-based liveness, and reconnects after 3 consecutive failed streaming requests instead of looping on a dead connection;
+8. serializes token refreshes across cameras (Nanit rotates refresh tokens; concurrent refreshes can invalidate the session) and only force-refreshes when a WebSocket handshake is rejected with 401/403;
+9. falls back to the baby list cached in the session file (or retries with backoff) when discovery fails at startup, instead of crash-looping.
 
 ## Configuration
 
-Environment variables:
+Environment variables. Malformed duration or integer values abort startup with an error naming the offending variable (they are not silently replaced with defaults).
 
 | Name | Default | Description |
 | --- | --- | --- |

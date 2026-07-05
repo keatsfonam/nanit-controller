@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"git.keatsfonam.com/lab/nanit-controller/internal/session"
+	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
 func TestStatusRegistryServesReadyzJSONWithHTTP200(t *testing.T) {

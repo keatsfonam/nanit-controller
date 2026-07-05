@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"git.keatsfonam.com/lab/nanit-controller/internal/session"
+	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
 var ErrExpiredRefreshToken = errors.New("refresh token expired")

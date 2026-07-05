@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"git.keatsfonam.com/lab/nanit-controller/internal/config"
-	"git.keatsfonam.com/lab/nanit-controller/internal/controller"
-	"git.keatsfonam.com/lab/nanit-controller/internal/session"
+	"github.com/keatsfonam/nanit-controller/internal/config"
+	"github.com/keatsfonam/nanit-controller/internal/controller"
+	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
 func main() {

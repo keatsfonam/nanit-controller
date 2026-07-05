@@ -1,4 +1,4 @@
-module git.keatsfonam.com/lab/nanit-controller
+module github.com/keatsfonam/nanit-controller
 
 go 1.24
 

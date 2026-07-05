@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"git.keatsfonam.com/lab/nanit-controller/internal/config"
-	"git.keatsfonam.com/lab/nanit-controller/internal/nanit"
-	"git.keatsfonam.com/lab/nanit-controller/internal/session"
+	"github.com/keatsfonam/nanit-controller/internal/config"
+	"github.com/keatsfonam/nanit-controller/internal/nanit"
+	"github.com/keatsfonam/nanit-controller/internal/session"
 	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 )
 

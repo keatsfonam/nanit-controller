@@ -1,48 +1,31 @@
 # nanit-controller
 
 [![CI](https://github.com/keatsfonam/nanit-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/keatsfonam/nanit-controller/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A minimal controller that keeps selected [Nanit](https://www.nanit.com/) baby-monitor cameras publishing their local RTMP stream into [MediaMTX](https://github.com/bluenviron/mediamtx), so the feed can be consumed by [Frigate](https://frigate.video/) or any other NVR — no cloud round-trip for video.
+Minimal controller that keeps selected [Nanit](https://www.nanit.com/) cameras publishing local RTMP to [MediaMTX](https://github.com/bluenviron/mediamtx), so [Frigate](https://frigate.video/) or any other NVR can use the stream without going through Nanit's cloud.
 
-```
-Nanit camera ──RTMP──▶ MediaMTX ◀──RTSP/etc── Frigate / NVR
-      ▲                    ▲
-      │ websocket          │ path readiness (API)
-      └──── nanit-controller ────┘
-```
+It does not serve RTMP, MQTT, Home Assistant entities, or sensor data. It only:
 
-Unlike full-featured integrations, this project deliberately does **not** serve RTMP itself, speak MQTT, or expose Home Assistant entities or sensor data. It only:
-
-1. refreshes and persists Nanit auth state (`session.json`);
+1. refreshes/persists Nanit auth state;
 2. discovers configured babies/cameras;
 3. opens Nanit WebSocket control connections;
-4. sends `PUT_STREAMING STARTED` with an explicit RTMP URL pointing at your MediaMTX instance;
+4. sends `PUT_STREAMING STARTED` with an explicit RTMP URL;
 5. monitors MediaMTX path readiness and re-requests streaming when the publisher disappears;
-6. backs off per camera, releases WebSockets on Nanit connection-limit errors, and can reset stale local-streaming state with `STOPPED`/`STARTED`;
-7. enforces WebSocket read/write deadlines with ping-based liveness, and reconnects after 3 consecutive failed streaming requests instead of looping on a dead connection;
-8. serializes token refreshes across cameras (Nanit rotates refresh tokens; concurrent refreshes can invalidate the session) and only force-refreshes when a WebSocket handshake is rejected with 401/403;
-9. falls back to the baby list cached in the session file (or retries with backoff) when discovery fails at startup, instead of crash-looping.
+6. backs off per camera, releases WebSockets on Nanit connection-limit errors, and can reset stale local-streaming state with `STOPPED`/`STARTED`.
 
-## Getting started
+## Setup
 
-### Prerequisites
+You need a MediaMTX instance with its API enabled and its RTMP port reachable from the camera's network, plus a Nanit refresh token and the UIDs of the babies you want to stream.
 
-- A running MediaMTX instance whose RTMP port is reachable **from the camera's network**, with its API enabled.
-- A Nanit account refresh token (see below).
-- Your baby UID(s) — visible in the Nanit app/web URLs, or in `session.json` after first authentication.
-
-### Acquire a refresh token
-
-Nanit requires 2FA, so the initial login is interactive. The easiest way is the `init-nanit.sh` helper from the [indiefan/home_assistant_nanit](https://github.com/indiefan/home_assistant_nanit) project, which writes a `session.json` this controller can read directly:
+Nanit logins require 2FA, so getting the first refresh token is interactive. The `init-nanit.sh` script from [indiefan/home_assistant_nanit](https://github.com/indiefan/home_assistant_nanit) handles this and writes a `session.json` that this controller reads as-is:
 
 ```sh
 docker run --rm -it -v /path/to/data:/data indiefan/nanit ./init-nanit.sh
 ```
 
-Alternatively, set `NANIT_BOOTSTRAP_REFRESH_TOKEN` to a refresh token obtained any other way; the controller bootstraps its own `session.json` from it. Note that Nanit refresh tokens are single-use: the controller rotates and persists them, so the session file must live on durable storage.
+If you already have a refresh token from elsewhere, set `NANIT_BOOTSTRAP_REFRESH_TOKEN` instead. Refresh tokens are single-use: the controller rotates and persists them, so keep `/data` on durable storage.
 
-### Run
+Then:
 
 ```sh
 docker run -d --name nanit-controller \
@@ -54,11 +37,11 @@ docker run -d --name nanit-controller \
   ghcr.io/keatsfonam/nanit-controller:latest
 ```
 
-On Kubernetes, run it as a single-replica Deployment with `/data` on a PersistentVolume and the bootstrap token in a Secret. Keep one replica: each controller consumes Nanit "mobile app" connection slots.
+On Kubernetes: single-replica Deployment, `/data` on a PersistentVolume, bootstrap token in a Secret. Don't run more than one replica; each instance takes up a Nanit "mobile app" connection slot.
 
 ## Configuration
 
-Environment variables. Malformed duration or integer values abort startup with an error naming the offending variable (they are not silently replaced with defaults).
+Environment variables. Malformed durations or integers abort startup rather than silently falling back to defaults.
 
 | Name | Default | Description |
 | --- | --- | --- |
@@ -95,18 +78,14 @@ go test -race ./...
 go run ./cmd/nanit-controller
 ```
 
-CI runs vet, build, race-enabled tests, and a Docker build on every push and pull request. Pushing a `v*` tag publishes a multi-arch (amd64/arm64) image to `ghcr.io/keatsfonam/nanit-controller`.
+CI runs vet, build, tests (with `-race`), and a Docker build. Tags matching `v*` publish a multi-arch (amd64/arm64) image to `ghcr.io/keatsfonam/nanit-controller`.
 
-## Attribution
+## Credits
 
-This controller is a small, from-scratch implementation, but it stands on the shoulders of the people who reverse-engineered the Nanit protocol:
+- [adam.stanek/nanit](https://gitlab.com/adam.stanek/nanit) reverse-engineered Nanit's local-streaming and WebSocket control protocol (WTFPL). None of this would work without that project.
+- [indiefan/home_assistant_nanit](https://github.com/indiefan/home_assistant_nanit) is the maintained fork that added 2FA support. This controller imports its generated protobuf definitions (`pkg/client`) and shares its `session.json` format.
 
-- [adam.stanek/nanit](https://gitlab.com/adam.stanek/nanit) — the original Nanit local-streaming project (WTFPL), which figured out the RTMP local-streaming and WebSocket control protocol this whole ecosystem relies on.
-- [indiefan/home_assistant_nanit](https://github.com/indiefan/home_assistant_nanit) — the maintained fork that added support for Nanit's now-required 2FA authentication. This project imports its generated protobuf definitions (`pkg/client`) for the WebSocket protocol, and its `init-nanit.sh` is the recommended way to obtain a refresh token. The `session.json` format is compatible.
-
-## Disclaimer
-
-This is an unofficial, community project. It is not affiliated with, endorsed by, or supported by Nanit. It uses undocumented APIs that may change or break at any time. Use at your own risk.
+Not affiliated with Nanit. Everything here relies on undocumented APIs that can change without notice.
 
 ## License
 

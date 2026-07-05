@@ -44,16 +44,14 @@ func NewClient(store *session.Store, log *slog.Logger) *Client {
 func (c *Client) EnsureAuthorized(ctx context.Context, bootstrapRefreshToken string, force bool) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
-	// Re-check under the lock: a goroutine that waited here behind a
-	// successful refresh must not consume the freshly rotated token again.
+	// Re-check under the lock: another goroutine may have refreshed while we waited.
 	s := c.store.Snapshot()
 	if s.AuthToken != "" {
 		age := time.Since(s.AuthTime)
 		if !force && age < 45*time.Minute {
 			return nil
 		}
-		// A token refreshed moments ago satisfies force: another goroutine
-		// already re-authorized after the failure the caller observed.
+		// A token this fresh postdates whatever failure prompted the force.
 		if force && age < 30*time.Second {
 			return nil
 		}

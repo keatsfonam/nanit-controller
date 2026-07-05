@@ -92,8 +92,8 @@ func (w *WS) keepAliveLoop() {
 				_ = w.Close()
 				return
 			}
-			// The websocket-level ping solicits a pong that extends the read
-			// deadline; app-level KEEPALIVE messages get no response.
+			// Nanit doesn't answer app-level keepalives, so also send a ws-level
+			// ping; the pong refreshes the read deadline.
 			if err := w.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
 				w.log.Warn("ping failed", "error", err)
 				_ = w.Close()

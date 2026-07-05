@@ -5,7 +5,7 @@ go 1.24
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/indiefan/home_assistant_nanit v1.3.5
-	google.golang.org/protobuf v1.36.5
+	google.golang.org/protobuf v1.36.11
 )
 
 require (

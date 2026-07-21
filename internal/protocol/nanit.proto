@@ -1,0 +1,61 @@
+// Nanit control protocol subset used by nanit-controller.
+//
+// Field numbers and enum values are based on the reverse-engineering work in
+// Adam Staněk's nanit project and the later indiefan/home_assistant_nanit fork:
+//   https://gitlab.com/adam.stanek/nanit
+//   https://github.com/indiefan/home_assistant_nanit
+//
+// The original project states that its work is available under WTFPL v2.
+// This repository owns and maintains this reduced schema; it intentionally
+// excludes unrelated camera controls and sensor messages.
+
+syntax = "proto2";
+
+package nanitpb;
+
+option go_package = "github.com/keatsfonam/nanit-controller/internal/protocol/nanitpb";
+
+enum RequestType {
+  PUT_STREAMING = 2;
+}
+
+enum StreamIdentifier {
+  MOBILE = 2;
+}
+
+message Streaming {
+  enum Status {
+    STARTED = 0;
+    STOPPED = 1;
+  }
+
+  required StreamIdentifier id = 1;
+  required Status status = 2;
+  required string rtmp_url = 3;
+  optional int32 attempts = 4;
+}
+
+message Request {
+  required int32 id = 1;
+  required RequestType type = 2;
+  optional Streaming streaming = 4;
+}
+
+message Response {
+  required int32 request_id = 1;
+  required RequestType request_type = 2;
+  required int32 status_code = 3;
+  optional string status_message = 4;
+}
+
+message Message {
+  enum Type {
+    KEEPALIVE = 0;
+    REQUEST = 1;
+    RESPONSE = 2;
+  }
+
+  required Type type = 1;
+  optional Request request = 2;
+  optional Response response = 3;
+}

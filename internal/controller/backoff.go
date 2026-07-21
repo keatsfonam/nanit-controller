@@ -35,7 +35,11 @@ func (b *exponentialBackoff) Next(base time.Duration) time.Duration {
 		delay = b.max
 	}
 	b.attempt++
-	return b.withJitter(delay)
+	delay = b.withJitter(delay)
+	if delay > b.max {
+		return b.max
+	}
+	return delay
 }
 
 func (b *exponentialBackoff) Reset() {

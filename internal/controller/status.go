@@ -3,18 +3,14 @@ package controller
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
-
-	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
 type CameraStatus struct {
 	BabyUID                            string     `json:"baby_uid"`
-	CameraUID                          string     `json:"camera_uid,omitempty"`
-	BabyName                           string     `json:"baby_name,omitempty"`
 	Path                               string     `json:"path,omitempty"`
-	RTMPURL                            string     `json:"rtmp_url,omitempty"`
 	State                              string     `json:"state"`
 	WebsocketConnected                 bool       `json:"websocket_connected"`
 	PublisherPresent                   bool       `json:"publisher_present"`
@@ -38,29 +34,27 @@ type StatusSnapshot struct {
 }
 
 type StatusRegistry struct {
-	mu      sync.RWMutex
-	cameras map[string]CameraStatus
+	mu          sync.RWMutex
+	cameras     map[string]CameraStatus
+	initialized bool
 }
 
 func NewStatusRegistry() *StatusRegistry {
 	return &StatusRegistry{cameras: map[string]CameraStatus{}}
 }
 
-func (r *StatusRegistry) RegisterBaby(baby session.Baby, path, rtmpURL string) {
+func (r *StatusRegistry) RegisterBaby(babyUID, path string) {
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	st := r.cameras[baby.UID]
-	st.BabyUID = baby.UID
-	st.CameraUID = baby.CameraUID
-	st.BabyName = baby.Name
+	st := r.cameras[babyUID]
+	st.BabyUID = babyUID
 	st.Path = path
-	st.RTMPURL = rtmpURL
 	if st.State == "" {
 		st.State = "registered"
 	}
 	st.UpdatedAt = now
-	r.cameras[baby.UID] = st
+	r.cameras[babyUID] = st
 }
 
 func (r *StatusRegistry) RegisterMissing(uid string) {
@@ -73,6 +67,12 @@ func (r *StatusRegistry) RegisterMissing(uid string) {
 	st.LastError = "configured baby UID not found in Nanit account"
 	st.UpdatedAt = now
 	r.cameras[uid] = st
+}
+
+func (r *StatusRegistry) SetInitialized() {
+	r.mu.Lock()
+	r.initialized = true
+	r.mu.Unlock()
 }
 
 func (r *StatusRegistry) Update(uid string, fn func(*CameraStatus)) {
@@ -89,19 +89,52 @@ func (r *StatusRegistry) Update(uid string, fn func(*CameraStatus)) {
 func (r *StatusRegistry) Snapshot() StatusSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
 	cameras := make([]CameraStatus, 0, len(r.cameras))
-	status := "ok"
 	for _, st := range r.cameras {
 		cameras = append(cameras, st)
-		if st.State != "ready" && st.State != "registered" {
+	}
+	sort.Slice(cameras, func(i, j int) bool { return cameras[i].BabyUID < cameras[j].BabyUID })
+	if !r.initialized {
+		return StatusSnapshot{Status: "initializing", Cameras: cameras}
+	}
+	status := "ok"
+	if len(cameras) == 0 {
+		status = "degraded"
+	}
+	for _, st := range cameras {
+		if st.State != "ready" {
 			status = "degraded"
+			break
 		}
 	}
 	return StatusSnapshot{Status: status, Cameras: cameras}
 }
 
+// ServeHTTP is the readiness view. Startup is not ready until discovery has
+// completed; camera-level degradation remains HTTP 200 to avoid restart churn.
 func (r *StatusRegistry) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	snapshot := r.Snapshot()
+	code := http.StatusOK
+	if snapshot.Status == "initializing" {
+		code = http.StatusServiceUnavailable
+	}
+	writeSnapshot(w, snapshot, code)
+}
+
+// ServeStatusHTTP always returns HTTP 200 for monitoring and diagnostics.
+func (r *StatusRegistry) ServeStatusHTTP(w http.ResponseWriter, _ *http.Request) {
+	writeSnapshot(w, r.Snapshot(), http.StatusOK)
+}
+
+func writeSnapshot(w http.ResponseWriter, snapshot StatusSnapshot, code int) {
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		http.Error(w, "encode status", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(r.Snapshot())
+	w.WriteHeader(code)
+	_, _ = w.Write(append(data, '\n'))
 }

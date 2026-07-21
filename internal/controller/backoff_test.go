@@ -32,4 +32,7 @@ func TestExponentialBackoffJitterStaysWithinBounds(t *testing.T) {
 	if got < 4*time.Second || got > 6*time.Second {
 		t.Fatalf("jittered delay %s outside expected bounds", got)
 	}
+	if got := b.Next(10 * time.Second); got > 10*time.Second {
+		t.Fatalf("jittered delay %s exceeded configured maximum", got)
+	}
 }

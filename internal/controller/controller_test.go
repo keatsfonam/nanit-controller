@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/keatsfonam/nanit-controller/internal/config"
 	"github.com/keatsfonam/nanit-controller/internal/nanit"
+	"github.com/keatsfonam/nanit-controller/internal/protocol/nanitpb"
 	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
@@ -23,6 +23,7 @@ type fakeNanitService struct {
 	fetchCalls  int
 	failFetches int
 	babies      []session.Baby
+	authErr     error
 }
 
 func (f *fakeNanitService) EnsureAuthorized(_ context.Context, _, rejectedAccessToken string) error {
@@ -31,7 +32,7 @@ func (f *fakeNanitService) EnsureAuthorized(_ context.Context, _, rejectedAccess
 	if rejectedAccessToken != "" {
 		f.forceCalls++
 	}
-	return nil
+	return f.authErr
 }
 
 func (f *fakeNanitService) FetchBabies(context.Context, string) ([]session.Baby, error) {
@@ -51,27 +52,33 @@ func (f *fakeNanitService) counts() (fetch, force int) {
 }
 
 type fakeMediaChecker struct {
-	ready bool
-	err   error
+	ready   bool
+	err     error
+	onCheck func()
 }
 
-func (f fakeMediaChecker) PathReady(context.Context, string) (bool, error) { return f.ready, f.err }
+func (f fakeMediaChecker) PathReady(context.Context, string) (bool, error) {
+	if f.onCheck != nil {
+		f.onCheck()
+	}
+	return f.ready, f.err
+}
 
 type fakeStreamConn struct {
 	mu      sync.Mutex
 	done    chan struct{}
 	closed  bool
-	calls   []indie.Streaming_Status
-	errFor  map[indie.Streaming_Status]error
-	onSend  func(status indie.Streaming_Status)
+	calls   []nanitpb.Streaming_Status
+	errFor  map[nanitpb.Streaming_Status]error
+	onSend  func(status nanitpb.Streaming_Status)
 	onClose func()
 }
 
 func newFakeStreamConn() *fakeStreamConn {
-	return &fakeStreamConn{done: make(chan struct{}), errFor: map[indie.Streaming_Status]error{}}
+	return &fakeStreamConn{done: make(chan struct{}), errFor: map[nanitpb.Streaming_Status]error{}}
 }
 
-func (f *fakeStreamConn) SendStreaming(_ context.Context, _ string, status indie.Streaming_Status, _ time.Duration) error {
+func (f *fakeStreamConn) SendStreaming(_ context.Context, _ string, status nanitpb.Streaming_Status, _ time.Duration) error {
 	f.mu.Lock()
 	f.calls = append(f.calls, status)
 	err := f.errFor[status]
@@ -99,10 +106,10 @@ func (f *fakeStreamConn) Close() error {
 	return nil
 }
 
-func (f *fakeStreamConn) Calls() []indie.Streaming_Status {
+func (f *fakeStreamConn) Calls() []nanitpb.Streaming_Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]indie.Streaming_Status(nil), f.calls...)
+	return append([]nanitpb.Streaming_Status(nil), f.calls...)
 }
 
 func testController(t *testing.T, cfg config.Config) *Controller {
@@ -141,9 +148,9 @@ func TestRunBabyClosesWebsocketBeforeConnectionLimitBackoff(t *testing.T) {
 	cfg := testConfig()
 	ctrl := testController(t, cfg)
 	baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
-	ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+	ctrl.status.RegisterBaby(baby.UID, cfg.PathName(baby.UID))
 	ws := newFakeStreamConn()
-	ws.errFor[indie.Streaming_STARTED] = nanit.ErrConnectionLimit
+	ws.errFor[nanitpb.Streaming_STARTED] = nanit.ErrConnectionLimit
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -171,24 +178,49 @@ func TestReconcileSendsStoppedThenStartedAfterMissingPublisherRetries(t *testing
 	ctrl := testController(t, cfg)
 	ctrl.mediamtx = fakeMediaChecker{ready: false}
 	baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
-	ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+	ctrl.status.RegisterBaby(baby.UID, cfg.PathName(baby.UID))
 	ws := newFakeStreamConn()
 	stopAfterResetStarted := false
-	ws.onSend = func(status indie.Streaming_Status) {
+	ws.onSend = func(status nanitpb.Streaming_Status) {
 		calls := ws.Calls()
-		if len(calls) >= 4 && calls[len(calls)-2] == indie.Streaming_STOPPED && status == indie.Streaming_STARTED {
+		if len(calls) >= 4 && calls[len(calls)-2] == nanitpb.Streaming_STOPPED && status == nanitpb.Streaming_STARTED {
 			stopAfterResetStarted = true
 			_ = ws.Close()
 		}
 	}
 
-	out := ctrl.reconcile(context.Background(), baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out := ctrl.reconcile(ctx, baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
 	if out != reconcileDisconnected || !stopAfterResetStarted {
 		t.Fatalf("unexpected outcome=%s stopAfterResetStarted=%v", out, stopAfterResetStarted)
 	}
-	want := []indie.Streaming_Status{indie.Streaming_STARTED, indie.Streaming_STARTED, indie.Streaming_STOPPED, indie.Streaming_STARTED}
+	want := []nanitpb.Streaming_Status{nanitpb.Streaming_STARTED, nanitpb.Streaming_STARTED, nanitpb.Streaming_STARTED, nanitpb.Streaming_STOPPED, nanitpb.Streaming_STARTED}
 	if got := ws.Calls(); !reflect.DeepEqual(got[:len(want)], want) {
 		t.Fatalf("unexpected streaming requests: got %v want prefix %v", got, want)
+	}
+}
+
+func TestReconcileStartsMissingGraceAtFirstObservedAbsence(t *testing.T) {
+	cfg := testConfig()
+	cfg.CheckInterval = 20 * time.Millisecond
+	cfg.MissingGrace = time.Millisecond
+	cfg.ReRequestInterval = time.Nanosecond
+	cfg.MissingPublisherRestartRetries = 0
+	ctrl := testController(t, cfg)
+	baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
+	ctrl.status.RegisterBaby(baby.UID, cfg.PathName(baby.UID))
+	ws := newFakeStreamConn()
+	ctrl.mediamtx = fakeMediaChecker{ready: false, onCheck: func() { _ = ws.Close() }}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out := ctrl.reconcile(ctx, baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
+	if out != reconcileDisconnected {
+		t.Fatalf("outcome = %s, want %s", out, reconcileDisconnected)
+	}
+	if got := ws.Calls(); !reflect.DeepEqual(got, []nanitpb.Streaming_Status{nanitpb.Streaming_STARTED}) {
+		t.Fatalf("streaming requests = %v, want only initial request", got)
 	}
 }
 
@@ -198,16 +230,63 @@ func TestReconcileReconnectsAfterConsecutiveSendFailures(t *testing.T) {
 	ctrl := testController(t, cfg)
 	ctrl.mediamtx = fakeMediaChecker{ready: false}
 	baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
-	ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+	ctrl.status.RegisterBaby(baby.UID, cfg.PathName(baby.UID))
 	ws := newFakeStreamConn()
-	ws.errFor[indie.Streaming_STARTED] = errors.New("stream request rejected")
+	ws.errFor[nanitpb.Streaming_STARTED] = errors.New("stream request rejected")
 
-	out := ctrl.reconcile(context.Background(), baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out := ctrl.reconcile(ctx, baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
 	if out != reconcileRequestsFailing {
 		t.Fatalf("outcome=%s, want %s", out, reconcileRequestsFailing)
 	}
 	if got := len(ws.Calls()); got != maxConsecutiveSendFailures {
 		t.Fatalf("streaming requests=%d, want %d", got, maxConsecutiveSendFailures)
+	}
+}
+
+func TestRunInitializesDegradedStatusForInvalidDiscovery(t *testing.T) {
+	tests := []struct {
+		name   string
+		babies []session.Baby
+		state  string
+	}{
+		{name: "baby missing", state: "baby_not_found"},
+		{name: "camera UID missing", babies: []session.Baby{{UID: "baby"}}, state: "camera_uid_missing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.BabyUIDs = []string{"baby"}
+			ctrl := testController(t, cfg)
+			ctrl.nanit = &fakeNanitService{babies: tt.babies}
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error, 1)
+			go func() { errCh <- ctrl.Run(ctx) }()
+
+			deadline := time.NewTimer(time.Second)
+			defer deadline.Stop()
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			for {
+				snapshot := ctrl.Status().Snapshot()
+				if snapshot.Status == "degraded" && len(snapshot.Cameras) == 1 {
+					if snapshot.Cameras[0].State != tt.state {
+						t.Fatalf("unexpected camera status: %#v", snapshot.Cameras[0])
+					}
+					break
+				}
+				select {
+				case <-deadline.C:
+					t.Fatalf("controller did not initialize status: %#v", snapshot)
+				case <-ticker.C:
+				}
+			}
+			cancel()
+			if err := <-errCh; !errors.Is(err, context.Canceled) {
+				t.Fatalf("Run error = %v, want context canceled", err)
+			}
+		})
 	}
 }
 
@@ -272,7 +351,7 @@ func TestRunBabyForcesRefreshOnlyOnAuthDialFailure(t *testing.T) {
 			svc := &fakeNanitService{}
 			ctrl.nanit = svc
 			baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
-			ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+			ctrl.status.RegisterBaby(baby.UID, cfg.PathName(baby.UID))
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -295,11 +374,13 @@ func TestReconcileReturnsConnectionLimitDuringReset(t *testing.T) {
 	ctrl := testController(t, cfg)
 	ctrl.mediamtx = fakeMediaChecker{ready: false}
 	baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}
-	ctrl.status.RegisterBaby(baby, cfg.PathName(baby.UID), cfg.RTMPURL(baby.UID))
+	ctrl.status.RegisterBaby(baby.UID, cfg.PathName(baby.UID))
 	ws := newFakeStreamConn()
-	ws.errFor[indie.Streaming_STOPPED] = nanit.ErrConnectionLimit
+	ws.errFor[nanitpb.Streaming_STOPPED] = nanit.ErrConnectionLimit
 
-	out := ctrl.reconcile(context.Background(), baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out := ctrl.reconcile(ctx, baby, ws, ctrl.log, newExponentialBackoff(time.Second, 0, nil))
 	if out != reconcileConnectionLimit {
 		t.Fatalf("outcome=%s, want %s", out, reconcileConnectionLimit)
 	}

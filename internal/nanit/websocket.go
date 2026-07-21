@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
+	"github.com/keatsfonam/nanit-controller/internal/protocol/nanitpb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -37,18 +39,22 @@ type WS struct {
 	pending   map[int32]chan responseResult
 	closed    chan struct{}
 	closeOnce sync.Once
+	closeErr  error
 }
 
 type responseResult struct {
-	res *indie.Response
 	err error
 }
 
 func DialWS(ctx context.Context, cameraUID, accessToken string, log *slog.Logger) (*WS, error) {
-	url := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%s/user_connect", cameraUID)
+	endpoint := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%s/user_connect", url.PathEscape(cameraUID))
+	return dialWS(ctx, endpoint, accessToken, log)
+}
+
+func dialWS(ctx context.Context, endpoint, accessToken string, log *slog.Logger) (*WS, error) {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+accessToken)
-	conn, res, err := websocket.DefaultDialer.DialContext(ctx, url, header)
+	conn, res, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		if res != nil && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
 			return nil, fmt.Errorf("%w: status=%d: %v", ErrDialUnauthorized, res.StatusCode, err)
@@ -64,7 +70,12 @@ func DialWS(ctx context.Context, cameraUID, accessToken string, log *slog.Logger
 		_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(wsWriteTimeout))
 	})
-	w := &WS{conn: conn, log: log.With("camera_uid", cameraUID), pending: map[int32]chan responseResult{}, closed: make(chan struct{})}
+	w := &WS{
+		conn:    conn,
+		log:     log.With("component", "websocket"),
+		pending: map[int32]chan responseResult{},
+		closed:  make(chan struct{}),
+	}
 	go w.readLoop()
 	go w.keepAliveLoop()
 	w.log.Info("connected to Nanit websocket")
@@ -72,8 +83,11 @@ func DialWS(ctx context.Context, cameraUID, accessToken string, log *slog.Logger
 }
 
 func (w *WS) Close() error {
-	w.closeOnce.Do(func() { close(w.closed) })
-	return w.conn.Close()
+	w.closeOnce.Do(func() {
+		close(w.closed)
+		w.closeErr = w.conn.Close()
+	})
+	return w.closeErr
 }
 
 func (w *WS) Done() <-chan struct{} { return w.closed }
@@ -86,14 +100,14 @@ func (w *WS) keepAliveLoop() {
 		case <-w.closed:
 			return
 		case <-t.C:
-			msg := &indie.Message{Type: indie.Message_Type(indie.Message_KEEPALIVE).Enum()}
+			msg := &nanitpb.Message{Type: nanitpb.Message_KEEPALIVE.Enum()}
 			if err := w.send(msg); err != nil {
 				w.log.Warn("keepalive failed", "error", err)
 				_ = w.Close()
 				return
 			}
-			// Nanit doesn't answer app-level keepalives, so also send a ws-level
-			// ping; the pong refreshes the read deadline.
+			// Nanit does not answer app-level keepalives; a WebSocket pong
+			// refreshes the read deadline and detects half-open connections.
 			if err := w.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
 				w.log.Warn("ping failed", "error", err)
 				_ = w.Close()
@@ -104,55 +118,53 @@ func (w *WS) keepAliveLoop() {
 }
 
 func (w *WS) readLoop() {
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	for {
 		_, data, err := w.conn.ReadMessage()
 		if err != nil {
-			w.log.Warn("websocket read failed", "error", err)
+			select {
+			case <-w.closed:
+				w.log.Debug("websocket reader stopped")
+			default:
+				w.log.Warn("websocket read failed", "error", err)
+			}
 			w.failAll(err)
 			return
 		}
 		_ = w.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-		var msg indie.Message
+		var msg nanitpb.Message
 		if err := proto.Unmarshal(data, &msg); err != nil {
 			w.log.Warn("malformed websocket protobuf", "error", err)
 			continue
 		}
-		if msg.Type != nil && *msg.Type == indie.Message_RESPONSE && msg.Response != nil {
+		if msg.Type != nil && *msg.Type == nanitpb.Message_RESPONSE && msg.Response != nil {
 			w.handleResponse(msg.Response)
 		}
 	}
 }
 
-func (w *WS) handleResponse(res *indie.Response) {
+func (w *WS) handleResponse(res *nanitpb.Response) {
 	if res.RequestId == nil {
 		return
 	}
-	id := *res.RequestId
-	w.pendingMu.Lock()
-	ch := w.pending[id]
-	delete(w.pending, id)
-	w.pendingMu.Unlock()
+	ch := w.removePending(*res.RequestId)
 	if ch == nil {
 		return
 	}
+	ch <- responseResult{err: responseError(res)}
+}
+
+func responseError(res *nanitpb.Response) error {
 	if res.StatusCode == nil {
-		ch <- responseResult{res: res, err: errors.New("response missing status code")}
-		return
+		return errors.New("response missing status code")
 	}
-	if *res.StatusCode != http.StatusOK {
-		msg := res.GetStatusMessage()
-		if msg == "" {
-			msg = fmt.Sprintf("unexpected status code %d", *res.StatusCode)
-		}
-		err := errors.New(msg)
-		if msg == "Forbidden: Number of Mobile App connections above limit, declining connection" {
-			err = fmt.Errorf("%w: %s", ErrConnectionLimit, msg)
-		}
-		ch <- responseResult{res: res, err: err}
-		return
+	if *res.StatusCode == http.StatusOK {
+		return nil
 	}
-	ch <- responseResult{res: res}
+	if strings.Contains(strings.ToLower(res.GetStatusMessage()), "mobile app connections above limit") {
+		return ErrConnectionLimit
+	}
+	return fmt.Errorf("websocket request rejected: status=%d", *res.StatusCode)
 }
 
 func (w *WS) failAll(err error) {
@@ -164,17 +176,25 @@ func (w *WS) failAll(err error) {
 	}
 }
 
-func (w *WS) SendStreaming(ctx context.Context, rtmpURL string, status indie.Streaming_Status, timeout time.Duration) error {
+func (w *WS) removePending(id int32) chan responseResult {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	ch := w.pending[id]
+	delete(w.pending, id)
+	return ch
+}
+
+func (w *WS) SendStreaming(ctx context.Context, rtmpURL string, status nanitpb.Streaming_Status, timeout time.Duration) error {
 	id := atomic.AddInt32(&w.nextID, 1)
-	msg := &indie.Message{
-		Type: indie.Message_Type(indie.Message_REQUEST).Enum(),
-		Request: &indie.Request{
+	msg := &nanitpb.Message{
+		Type: nanitpb.Message_REQUEST.Enum(),
+		Request: &nanitpb.Request{
 			Id:   &id,
-			Type: indie.RequestType(indie.RequestType_PUT_STREAMING).Enum(),
-			Streaming: &indie.Streaming{
-				Id:       indie.StreamIdentifier(indie.StreamIdentifier_MOBILE).Enum(),
+			Type: nanitpb.RequestType_PUT_STREAMING.Enum(),
+			Streaming: &nanitpb.Streaming{
+				Id:       nanitpb.StreamIdentifier_MOBILE.Enum(),
 				RtmpUrl:  &rtmpURL,
-				Status:   indie.Streaming_Status(status).Enum(),
+				Status:   status.Enum(),
 				Attempts: int32p(1),
 			},
 		},
@@ -184,32 +204,32 @@ func (w *WS) SendStreaming(ctx context.Context, rtmpURL string, status indie.Str
 	w.pending[id] = ch
 	w.pendingMu.Unlock()
 	if err := w.send(msg); err != nil {
-		w.pendingMu.Lock()
-		delete(w.pending, id)
-		w.pendingMu.Unlock()
+		w.removePending(id)
 		return err
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		w.pendingMu.Lock()
-		delete(w.pending, id)
-		w.pendingMu.Unlock()
+		w.removePending(id)
 		return ctx.Err()
 	case <-w.closed:
+		w.removePending(id)
 		return errors.New("websocket closed")
 	case <-timer.C:
-		w.pendingMu.Lock()
-		delete(w.pending, id)
-		w.pendingMu.Unlock()
+		w.removePending(id)
 		return errors.New("request timeout")
 	case rr := <-ch:
 		return rr.err
 	}
 }
 
-func (w *WS) send(msg *indie.Message) error {
+func (w *WS) send(msg *nanitpb.Message) error {
+	select {
+	case <-w.closed:
+		return errors.New("websocket closed")
+	default:
+	}
 	b, err := proto.Marshal(msg)
 	if err != nil {
 		return err

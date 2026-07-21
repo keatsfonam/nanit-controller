@@ -5,13 +5,14 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
-	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/keatsfonam/nanit-controller/internal/config"
 	"github.com/keatsfonam/nanit-controller/internal/mediamtx"
 	"github.com/keatsfonam/nanit-controller/internal/nanit"
+	"github.com/keatsfonam/nanit-controller/internal/protocol/nanitpb"
 	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
@@ -25,7 +26,7 @@ type mediaChecker interface {
 }
 
 type streamConn interface {
-	SendStreaming(ctx context.Context, rtmpURL string, status indie.Streaming_Status, timeout time.Duration) error
+	SendStreaming(ctx context.Context, rtmpURL string, status nanitpb.Streaming_Status, timeout time.Duration) error
 	Done() <-chan struct{}
 	Close() error
 }
@@ -78,13 +79,22 @@ func (c *Controller) Run(ctx context.Context) error {
 			c.log.Warn("configured baby UID not found in Nanit account", "baby_uid", uid)
 			continue
 		}
-		c.status.RegisterBaby(baby, c.cfg.PathName(baby.UID), c.cfg.RTMPURL(baby.UID))
+		if strings.TrimSpace(baby.CameraUID) == "" {
+			c.status.Update(uid, func(st *CameraStatus) {
+				st.State = "camera_uid_missing"
+				st.LastError = "Nanit baby record has no camera UID"
+			})
+			c.log.Warn("Nanit baby record has no camera UID", "baby_uid", uid)
+			continue
+		}
+		c.status.RegisterBaby(baby.UID, c.cfg.PathName(baby.UID))
 		wg.Add(1)
 		go func(b session.Baby) {
 			defer wg.Done()
 			c.runBaby(ctx, b)
 		}(baby)
 	}
+	c.status.SetInitialized()
 	<-ctx.Done()
 	wg.Wait()
 	return ctx.Err()
@@ -126,7 +136,7 @@ const (
 const maxConsecutiveSendFailures = 3
 
 func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
-	log := c.log.With("baby_uid", baby.UID, "camera_uid", baby.CameraUID, "baby_name", baby.Name)
+	log := c.log.With("baby_uid", baby.UID)
 	retry := newExponentialBackoff(c.cfg.RetryBackoffMax, 0.2, rand.New(rand.NewSource(time.Now().UnixNano())))
 	for ctx.Err() == nil {
 		if err := c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, ""); err != nil {
@@ -143,10 +153,19 @@ func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
 		ws, err := c.dialWS(ctx, baby.CameraUID, s.AuthToken, log)
 		if err != nil {
 			log.Error("websocket connection failed", "error", err)
-			// Only burn a refresh-token rotation when the handshake was
-			// rejected for auth reasons; network blips don't need it.
+			// Only rotate after the exact token used by an unauthorized
+			// handshake is still current; network failures do not consume it.
 			if errors.Is(err, nanit.ErrDialUnauthorized) {
-				_ = c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, s.AuthToken)
+				if authErr := c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, s.AuthToken); authErr != nil {
+					log.Error("reauthorization failed", "error", authErr)
+					c.status.Update(baby.UID, func(st *CameraStatus) {
+						st.State = "authorization_failed"
+						st.LastError = authErr.Error()
+						st.WebsocketConnected = false
+					})
+					c.sleepWithStatus(ctx, baby.UID, retry.Next(c.cfg.RetryBackoffInitial))
+					continue
+				}
 			}
 			c.status.Update(baby.UID, func(st *CameraStatus) {
 				st.State = "websocket_dial_failed"
@@ -197,14 +216,14 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 	rtmpURL := c.cfg.RTMPURL(baby.UID)
 	path := c.cfg.PathName(baby.UID)
 	lastRequest := time.Time{}
-	missingSince := time.Now()
+	missingSince := time.Time{}
 	missingRetryCount := 0
 	consecutiveSendFailures := 0
 
-	sendStreaming := func(status indie.Streaming_Status, reason string) reconcileOutcome {
+	sendStreaming := func(status nanitpb.Streaming_Status, reason string) reconcileOutcome {
 		now := time.Now()
 		statusName := streamingStatusName(status)
-		log.Info("requesting local streaming", "target", rtmpURL, "path", path, "reason", reason, "status", statusName)
+		log.Info("requesting local streaming", "path", path, "reason", reason, "status", statusName)
 		c.status.Update(baby.UID, func(st *CameraStatus) {
 			st.State = "requesting_streaming"
 			st.LastRequestStatus = statusName
@@ -221,7 +240,7 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 				st.State = "streaming_requested"
 				st.LastSuccessAt = &successAt
 				st.LastError = ""
-				if status == indie.Streaming_STARTED {
+				if status == nanitpb.Streaming_STARTED {
 					st.ConsecutiveConnectionLimitFailures = 0
 				}
 			})
@@ -254,7 +273,7 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 			return ""
 		}
 		lastRequest = time.Now()
-		return sendStreaming(indie.Streaming_STARTED, reason)
+		return sendStreaming(nanitpb.Streaming_STARTED, reason)
 	}
 
 	if out := requestStarted("websocket_connected"); out != "" {
@@ -323,9 +342,9 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 
 			missingRetryCount++
 			c.status.Update(baby.UID, func(st *CameraStatus) { st.MissingRetryCount = missingRetryCount })
-			if c.cfg.MissingPublisherRestartRetries > 0 && missingRetryCount >= c.cfg.MissingPublisherRestartRetries {
+			if c.cfg.MissingPublisherRestartRetries > 0 && missingRetryCount > c.cfg.MissingPublisherRestartRetries {
 				log.Warn("resetting local streaming after missing publisher retries", "path", path, "missing_retry_count", missingRetryCount)
-				if out := sendStreaming(indie.Streaming_STOPPED, "mediamtx_path_missing_reset"); out != "" {
+				if out := sendStreaming(nanitpb.Streaming_STOPPED, "mediamtx_path_missing_reset"); out != "" {
 					return out
 				}
 				c.sleep(ctx, 2*time.Second)
@@ -335,7 +354,7 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 				lastRequest = time.Now()
 				missingRetryCount = 0
 				c.status.Update(baby.UID, func(st *CameraStatus) { st.MissingRetryCount = 0 })
-				if out := sendStreaming(indie.Streaming_STARTED, "mediamtx_path_missing_reset"); out != "" {
+				if out := sendStreaming(nanitpb.Streaming_STARTED, "mediamtx_path_missing_reset"); out != "" {
 					return out
 				}
 				continue
@@ -348,11 +367,11 @@ func (c *Controller) reconcile(ctx context.Context, baby session.Baby, ws stream
 	}
 }
 
-func streamingStatusName(status indie.Streaming_Status) string {
+func streamingStatusName(status nanitpb.Streaming_Status) string {
 	switch status {
-	case indie.Streaming_STARTED:
+	case nanitpb.Streaming_STARTED:
 		return "STARTED"
-	case indie.Streaming_STOPPED:
+	case nanitpb.Streaming_STOPPED:
 		return "STOPPED"
 	default:
 		return status.String()

@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
+	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/keatsfonam/nanit-controller/internal/config"
 	"github.com/keatsfonam/nanit-controller/internal/nanit"
 	"github.com/keatsfonam/nanit-controller/internal/session"
-	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 )
 
 type fakeNanitService struct {
@@ -25,10 +25,10 @@ type fakeNanitService struct {
 	babies      []session.Baby
 }
 
-func (f *fakeNanitService) EnsureAuthorized(_ context.Context, _ string, force bool) error {
+func (f *fakeNanitService) EnsureAuthorized(_ context.Context, _, rejectedAccessToken string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if force {
+	if rejectedAccessToken != "" {
 		f.forceCalls++
 	}
 	return nil
@@ -263,6 +263,12 @@ func TestRunBabyForcesRefreshOnlyOnAuthDialFailure(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig()
 			ctrl := testController(t, cfg)
+			if err := ctrl.store.Update(func(s *session.Session) {
+				s.AuthToken = "rejected-access-token"
+				s.AuthTime = time.Now()
+			}); err != nil {
+				t.Fatal(err)
+			}
 			svc := &fakeNanitService{}
 			ctrl.nanit = svc
 			baby := session.Baby{UID: "baby", CameraUID: "camera", Name: "Baby"}

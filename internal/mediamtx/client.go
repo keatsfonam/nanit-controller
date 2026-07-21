@@ -3,11 +3,15 @@ package mediamtx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 )
+
+const maxResponseSize = 1 << 20
 
 type Client struct {
 	base string
@@ -59,13 +63,26 @@ func (c *Client) Paths(ctx context.Context) ([]Path, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("mediamtx paths list status %d", res.StatusCode)
 	}
+
+	limited := &io.LimitedReader{R: res.Body, N: maxResponseSize + 1}
+	decoder := json.NewDecoder(limited)
 	var pr pathsResponse
-	if err := json.NewDecoder(res.Body).Decode(&pr); err != nil {
+	if err := decoder.Decode(&pr); err != nil {
 		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("mediamtx response contains multiple JSON values")
+		}
+		return nil, err
+	}
+	if limited.N == 0 {
+		return nil, fmt.Errorf("mediamtx response exceeds %d bytes", maxResponseSize)
 	}
 	return pr.Items, nil
 }

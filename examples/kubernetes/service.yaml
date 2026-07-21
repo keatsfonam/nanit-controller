@@ -10,6 +10,12 @@ metadata:
   #   lbipam.cilium.io/ips: 192.168.1.10
 spec:
   type: LoadBalancer
+  # Replace this with the camera and NVR networks. Do not expose plaintext
+  # RTMP/RTSP ports to untrusted networks.
+  loadBalancerSourceRanges:
+    - 192.168.1.0/24
+  # Preserve source addresses for MediaMTX's publisher CIDR restriction.
+  externalTrafficPolicy: Local
   ports:
     - name: rtmp
       port: 1935

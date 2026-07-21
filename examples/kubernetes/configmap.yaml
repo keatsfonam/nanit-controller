@@ -8,12 +8,40 @@ data:
     logDestinations:
       - stdout
 
-    # The controller reads this API over localhost; don't expose it.
+    # The controller is the only API client. Keep the listener on loopback.
     api: true
-    apiAddress: :9997
+    apiAddress: 127.0.0.1:9997
     metrics: false
     pprof: false
     playback: false
+
+    authMethod: internal
+    authInternalUsers:
+      # Nanit publisher authentication is not enabled: camera support for
+      # MediaMTX's RTMP query-string credentials is unverified. Restrict this
+      # CIDR and the LoadBalancer source ranges to the camera network.
+      - user: any
+        pass:
+        ips:
+          - "192.168.1.0/24"
+        permissions:
+          - action: publish
+            path: "~^local/[A-Za-z0-9_-]+$"
+      # The Deployment overrides these two values from nanit-secret.
+      - user: replace-reader
+        pass: replace-password
+        ips:
+          - "192.168.1.0/24"
+        permissions:
+          - action: read
+            path: "~^local/[A-Za-z0-9_-]+$"
+      - user: any
+        pass:
+        ips:
+          - "127.0.0.1"
+          - "::1"
+        permissions:
+          - action: api
 
     rtsp: true
     rtspAddress: :8554
@@ -26,6 +54,7 @@ data:
     hls: false
     webrtc: false
     srt: false
+    moq: false
 
     pathDefaults:
       source: publisher

@@ -5,8 +5,8 @@ metadata:
   labels:
     app.kubernetes.io/name: nanit-relay
 spec:
-  # One replica, Recreate: the session PVC is RWO and each controller
-  # instance consumes a Nanit "mobile app" connection slot.
+  # One replica and Recreate are required: the session PVC is RWO, refresh
+  # tokens rotate, and each controller consumes a Nanit connection slot.
   replicas: 1
   strategy:
     type: Recreate
@@ -18,15 +18,38 @@ spec:
       labels:
         app.kubernetes.io/name: nanit-relay
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
       securityContext:
-        # The controller image runs as nonroot (uid 65532); this lets it
-        # write the session file on the PVC.
+        runAsNonRoot: true
         fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: mediamtx
-          image: bluenviron/mediamtx:1
+          image: bluenviron/mediamtx:1.19.2@sha256:f37aaaf1a707c42b0aff49a3ab5d4fa57a3504ebc3f27657434a820e3b16d730
           args:
             - /mediamtx.yml
+          env:
+            - name: MTX_AUTHINTERNALUSERS_1_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nanit-secret
+                  key: rtsp-username
+            - name: MTX_AUTHINTERNALUSERS_1_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nanit-secret
+                  key: rtsp-password
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsUser: 65532
           ports:
             - name: rtmp
               containerPort: 1935
@@ -44,17 +67,20 @@ spec:
               port: rtsp
             periodSeconds: 5
             failureThreshold: 24
+            timeoutSeconds: 2
           readinessProbe:
             tcpSocket:
               port: rtsp
             periodSeconds: 10
+            timeoutSeconds: 2
           livenessProbe:
             tcpSocket:
               port: rtsp
-            initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 2
         - name: controller
-          image: ghcr.io/keatsfonam/nanit-controller:0.1
+          # Deliberately non-runnable: publish this tree, then pin tag@digest.
+          image: ghcr.io/keatsfonam/nanit-controller:REPLACE_WITH_RELEASE
           env:
             - name: NANIT_BOOTSTRAP_REFRESH_TOKEN
               valueFrom:
@@ -62,10 +88,18 @@ spec:
                   name: nanit-secret
                   key: refresh-token
             - name: NANIT_BABY_UIDS
-              value: 0a1b2c3d,4e5f6a7b
-            # Must match the service's external IP; cameras connect to it.
+              value: REPLACE_WITH_BABY_UID
+            # Must match the LoadBalancer IP; cameras connect to this address.
             - name: NANIT_RTMP_PUBLIC_ADDR
-              value: 192.168.1.10:1935
+              value: REPLACE_WITH_LOAD_BALANCER_IP:1935
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsUser: 65532
           ports:
             - name: health
               containerPort: 8080
@@ -73,17 +107,25 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 12
+            timeoutSeconds: 2
           readinessProbe:
             httpGet:
               path: /readyz
               port: health
             periodSeconds: 10
+            timeoutSeconds: 2
           livenessProbe:
             httpGet:
               path: /healthz
               port: health
-            initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 2
       volumes:
         - name: config
           configMap:

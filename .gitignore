@@ -4,5 +4,10 @@
 .DS_Store
 coverage.out
 .claude/
+.pi-subagents/
+.env
+.env.*
+!.env.example
 session.json
 .nanit-session-recovery-*
+.mediamtx-review.yml

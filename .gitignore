@@ -5,3 +5,4 @@
 coverage.out
 .claude/
 session.json
+.nanit-session-recovery-*

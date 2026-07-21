@@ -16,16 +16,24 @@ import (
 	"github.com/keatsfonam/nanit-controller/internal/session"
 )
 
-var ErrExpiredRefreshToken = errors.New("refresh token expired")
+var (
+	ErrExpiredRefreshToken     = errors.New("refresh token expired")
+	ErrRefreshOutcomeUncertain = errors.New("refresh token rotation outcome uncertain")
+	ErrSessionPersistence      = errors.New("session persistence failed after token rotation")
+)
+
+const maxAPIResponseSize = 1 << 20
 
 type Client struct {
 	http    *http.Client
 	store   *session.Store
 	log     *slog.Logger
 	baseURL string
-	// refreshMu serializes token refreshes: Nanit rotates refresh tokens, so
-	// concurrent refreshes with the same token can invalidate the session.
+
+	// refreshMu serializes token rotations. fatalErr makes a persistence failure
+	// sticky so the client never retries a refresh token that Nanit consumed.
 	refreshMu sync.Mutex
+	fatalErr  error
 }
 
 type authResponse struct {
@@ -41,21 +49,29 @@ func NewClient(store *session.Store, log *slog.Logger) *Client {
 	return &Client{http: &http.Client{Timeout: 15 * time.Second}, store: store, log: log, baseURL: "https://api.nanit.com"}
 }
 
-func (c *Client) EnsureAuthorized(ctx context.Context, bootstrapRefreshToken string, force bool) error {
+// EnsureAuthorized refreshes a missing or stale access token. When an API call
+// rejects a token, pass that exact token as rejectedAccessToken. If another
+// goroutine rotated it while this call waited for refreshMu, no second rotation
+// is needed.
+func (c *Client) EnsureAuthorized(ctx context.Context, bootstrapRefreshToken, rejectedAccessToken string) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
-	// Re-check under the lock: another goroutine may have refreshed while we waited.
+
+	if c.fatalErr != nil {
+		return c.fatalErr
+	}
 	s := c.store.Snapshot()
-	if s.AuthToken != "" {
-		age := time.Since(s.AuthTime)
-		if !force && age < 45*time.Minute {
+	if rejectedAccessToken != "" {
+		if s.AuthToken != "" && s.AuthToken != rejectedAccessToken {
 			return nil
 		}
-		// A token this fresh postdates whatever failure prompted the force.
-		if force && age < 30*time.Second {
+	} else if s.AuthToken != "" {
+		age := time.Since(s.AuthTime)
+		if age >= 0 && age < 45*time.Minute {
 			return nil
 		}
 	}
+
 	refresh := strings.TrimSpace(s.RefreshToken)
 	if refresh == "" {
 		refresh = strings.TrimSpace(bootstrapRefreshToken)
@@ -63,7 +79,13 @@ func (c *Client) EnsureAuthorized(ctx context.Context, bootstrapRefreshToken str
 	if refresh == "" {
 		return errors.New("no refresh token in session or bootstrap secret")
 	}
-	return c.refresh(ctx, refresh)
+	if err := c.refresh(ctx, refresh); err != nil {
+		if errors.Is(err, ErrRefreshOutcomeUncertain) || errors.Is(err, ErrSessionPersistence) {
+			c.fatalErr = err
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *Client) refresh(ctx context.Context, refreshToken string) error {
@@ -78,37 +100,38 @@ func (c *Client) refresh(ctx context.Context, refreshToken string) error {
 	req.Header.Set("Content-Type", "application/json")
 	res, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: request failed: %v", ErrRefreshOutcomeUncertain, err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
+
 	if res.StatusCode == http.StatusNotFound {
 		return ErrExpiredRefreshToken
 	}
 	if res.StatusCode < 200 || res.StatusCode > 299 {
-		b, _ := io.ReadAll(io.LimitReader(res.Body, 512))
-		return fmt.Errorf("refresh token request failed: status=%d body=%q", res.StatusCode, string(b))
+		return fmt.Errorf("%w: response status=%d", ErrRefreshOutcomeUncertain, res.StatusCode)
 	}
 	var ar authResponse
-	if err := json.NewDecoder(res.Body).Decode(&ar); err != nil {
-		return err
+	if err := decodeJSON(res.Body, &ar); err != nil {
+		return fmt.Errorf("%w: decode response: %v", ErrRefreshOutcomeUncertain, err)
 	}
 	if ar.AccessToken == "" || ar.RefreshToken == "" {
-		return errors.New("refresh response missing token")
+		return fmt.Errorf("%w: response missing token", ErrRefreshOutcomeUncertain)
 	}
 	if err := c.store.Update(func(s *session.Session) {
 		s.AuthToken = ar.AccessToken
 		s.RefreshToken = ar.RefreshToken
 		s.AuthTime = time.Now()
 	}); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrSessionPersistence, err)
 	}
-	c.log.Info("authorized", "refresh_token_suffix", tokenSuffix(ar.RefreshToken), "access_token_suffix", tokenSuffix(ar.AccessToken))
+	c.log.Info("authorized")
 	return nil
 }
 
 func (c *Client) FetchBabies(ctx context.Context, bootstrapRefreshToken string) ([]session.Baby, error) {
+	rejectedAccessToken := ""
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := c.EnsureAuthorized(ctx, bootstrapRefreshToken, attempt > 0); err != nil {
+		if err := c.EnsureAuthorized(ctx, bootstrapRefreshToken, rejectedAccessToken); err != nil {
 			return nil, err
 		}
 		s := c.store.Snapshot()
@@ -123,28 +146,42 @@ func (c *Client) FetchBabies(ctx context.Context, bootstrapRefreshToken string) 
 		}
 		if res.StatusCode == http.StatusUnauthorized {
 			_ = res.Body.Close()
+			rejectedAccessToken = s.AuthToken
 			continue
 		}
 		if res.StatusCode != http.StatusOK {
-			b, _ := io.ReadAll(io.LimitReader(res.Body, 512))
 			_ = res.Body.Close()
-			return nil, fmt.Errorf("fetch babies failed: status=%d body=%q", res.StatusCode, string(b))
+			return nil, fmt.Errorf("fetch babies failed: status=%d", res.StatusCode)
 		}
 		var br babiesResponse
-		err = json.NewDecoder(res.Body).Decode(&br)
+		err = decodeJSON(res.Body, &br)
 		_ = res.Body.Close()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode babies response: %w", err)
 		}
-		_ = c.store.Update(func(s *session.Session) { s.Babies = br.Babies })
+		if err := c.store.Update(func(s *session.Session) { s.Babies = br.Babies }); err != nil {
+			return nil, fmt.Errorf("persist baby cache: %w", err)
+		}
 		return br.Babies, nil
 	}
 	return nil, errors.New("fetch babies failed after token refresh")
 }
 
-func tokenSuffix(v string) string {
-	if len(v) <= 4 {
-		return "****"
+func decodeJSON(r io.Reader, dst any) error {
+	limited := &io.LimitedReader{R: r, N: maxAPIResponseSize + 1}
+	decoder := json.NewDecoder(limited)
+	if err := decoder.Decode(dst); err != nil {
+		return err
 	}
-	return "..." + v[len(v)-4:]
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("response contains multiple JSON values")
+		}
+		return err
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("response exceeds %d bytes", maxAPIResponseSize)
+	}
+	return nil
 }

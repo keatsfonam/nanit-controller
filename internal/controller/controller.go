@@ -8,15 +8,15 @@ import (
 	"sync"
 	"time"
 
+	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/keatsfonam/nanit-controller/internal/config"
 	"github.com/keatsfonam/nanit-controller/internal/mediamtx"
 	"github.com/keatsfonam/nanit-controller/internal/nanit"
 	"github.com/keatsfonam/nanit-controller/internal/session"
-	indie "github.com/indiefan/home_assistant_nanit/pkg/client"
 )
 
 type nanitService interface {
-	EnsureAuthorized(ctx context.Context, bootstrapRefreshToken string, force bool) error
+	EnsureAuthorized(ctx context.Context, bootstrapRefreshToken, rejectedAccessToken string) error
 	FetchBabies(ctx context.Context, bootstrapRefreshToken string) ([]session.Baby, error)
 }
 
@@ -129,7 +129,7 @@ func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
 	log := c.log.With("baby_uid", baby.UID, "camera_uid", baby.CameraUID, "baby_name", baby.Name)
 	retry := newExponentialBackoff(c.cfg.RetryBackoffMax, 0.2, rand.New(rand.NewSource(time.Now().UnixNano())))
 	for ctx.Err() == nil {
-		if err := c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, false); err != nil {
+		if err := c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, ""); err != nil {
 			log.Error("authorization failed", "error", err)
 			c.status.Update(baby.UID, func(st *CameraStatus) {
 				st.State = "authorization_failed"
@@ -146,7 +146,7 @@ func (c *Controller) runBaby(ctx context.Context, baby session.Baby) {
 			// Only burn a refresh-token rotation when the handshake was
 			// rejected for auth reasons; network blips don't need it.
 			if errors.Is(err, nanit.ErrDialUnauthorized) {
-				_ = c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, true)
+				_ = c.nanit.EnsureAuthorized(ctx, c.cfg.BootstrapRefreshToken, s.AuthToken)
 			}
 			c.status.Update(baby.UID, func(st *CameraStatus) {
 				st.State = "websocket_dial_failed"
